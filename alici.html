@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Alıcı — Optik Transfer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+               background: #111; color: #eee; overflow: hidden; }
+  body { display: flex; flex-direction: column; }
+
+  header { padding: 8px 16px; background: #1a1a1a; display: flex; justify-content: space-between;
+           align-items: center; border-bottom: 1px solid #333; flex-shrink: 0; }
+  header h1 { font-size: 15px; font-weight: 600; }
+  header a { color: #6cf; text-decoration: none; font-size: 13px; }
+
+  .video-wrap { flex: 1; position: relative; background: #000; display: flex;
+                align-items: center; justify-content: center; min-height: 0; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .roi-overlay { position: absolute; top: 50%; left: 50%;
+                 transform: translate(-50%, -50%);
+                 border: 2px dashed #6cf; border-radius: 4px; pointer-events: none;
+                 box-shadow: 0 0 0 9999px rgba(0,0,0,0.35); }
+
+  .progress { height: 4px; background: #222; flex-shrink: 0; }
+  .progress > div { height: 100%; background: #6cf; width: 0%; transition: width 0.2s; }
+
+  .controls { padding: 10px 16px; background: #1a1a1a; display: flex; gap: 8px; flex-shrink: 0; }
+  button { flex: 1; padding: 10px 12px; border: none; border-radius: 6px; background: #6cf;
+           color: #000; font-weight: 600; font-size: 13px; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.danger { background: #f66; }
+
+  .status { padding: 6px 16px; background: #1a1a1a; font-size: 11px; color: #888;
+            font-family: ui-monospace, monospace; display: flex; gap: 16px;
+            flex-wrap: wrap; flex-shrink: 0; }
+  .status span { color: #eee; }
+
+  .result { padding: 12px 16px; background: #0a0a0a; border-top: 1px solid #333;
+            max-height: 30vh; overflow-y: auto; }
+  .result pre { font-family: ui-monospace, monospace; font-size: 13px; color: #6cf;
+                white-space: pre-wrap; word-break: break-word; }
+  .result.hidden { display: none; }
+  .result h3 { font-size: 12px; color: #888; margin-bottom: 6px; font-weight: normal; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📷 Alıcı</h1>
+  <a href="index.html">← Ana</a>
+</header>
+<div class="video-wrap">
+  <video id="video" playsinline autoplay muted></video>
+  <div class="roi-overlay" id="roi"></div>
+</div>
+<div class="progress"><div id="progressBar"></div></div>
+<div class="controls">
+  <button id="start">▶ Kamerayı Aç</button>
+  <button id="stop" class="danger" disabled>■ Durdur</button>
+  <button id="reset">↻</button>
+</div>
+<div class="status">
+  <div>Okunan: <span id="readInfo">0</span></div>
+  <div>Toplanan: <span id="gotInfo">0</span></div>
+  <div>Hedef: <span id="totalInfo">?</span></div>
+</div>
+<div class="result hidden" id="resultBox">
+  <h3>Gelen veri:</h3>
+  <pre id="result"></pre>
+</div>
+
+<script src="shared.js"></script>
+<script>
+  const video = document.getElementById('video');
+  const roi = document.getElementById('roi');
+  const startBtn = document.getElementById('start');
+  const stopBtn = document.getElementById('stop');
+  const resetBtn = document.getElementById('reset');
+  const readInfo = document.getElementById('readInfo');
+  const gotInfo = document.getElementById('gotInfo');
+  const totalInfo = document.getElementById('totalInfo');
+  const resultBox = document.getElementById('resultBox');
+  const resultPre = document.getElementById('result');
+  const progressBar = document.getElementById('progressBar');
+
+  const sampleCanvas = document.createElement('canvas');
+  const sctx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+  const SAMPLE_SIZE = 320;
+  const ROI_RATIO = 0.7;
+
+  let stream = null;
+  let running = false;
+  let rafId = null;
+  let receivedMap = new Map();
+  let knownTotal = null;
+  let knownLength = null;
+  let readCount = 0;
+
+  function updateRoiOverlay() {
+    const wrap = video.parentElement;
+    const minDim = Math.min(wrap.clientWidth, wrap.clientHeight);
+    const size = minDim * ROI_RATIO;
+    roi.style.width = size + 'px';
+    roi.style.height = size + 'px';
+  }
+
+  async function startCamera() {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Kamera erişimi için HTTPS veya localhost üzerinden açın; bazı dosya yöneticilerindeki önizleme kamera izni vermez.');
+      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
+      video.srcObject = stream;
+      await video.play();
+      running = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      loop();
+    } catch (err) {
+      alert('Kamera açılamadı: ' + (err && err.message ? err.message : 'Tarayıcı kamera erişimini reddetti.'));
+    }
+  }
+
+  function stopCamera() {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    video.srcObject = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  function readCellsFromImageData(imgData) {
+    const w = imgData.width;
+    const cellSize = w / GRID_SIZE;
+    const cells = new Uint8Array(CELLS);
+    const data = imgData.data;
+    const sampleRadius = Math.max(2, Math.floor(cellSize * 0.2));
+
+    for (let cy = 0; cy < GRID_SIZE; cy++) {
+      for (let cx = 0; cx < GRID_SIZE; cx++) {
+        const pxCenter = Math.floor((cx + 0.5) * cellSize);
+        const pyCenter = Math.floor((cy + 0.5) * cellSize);
+        let rSum = 0, gSum = 0, bSum = 0, count = 0;
+
+        for (let dy = -sampleRadius; dy <= sampleRadius; dy++) {
+          for (let dx = -sampleRadius; dx <= sampleRadius; dx++) {
+            const px = pxCenter + dx;
+            const py = pyCenter + dy;
+            if (px < 0 || py < 0 || px >= w || py >= imgData.height) continue;
+            const idx = (py * w + px) * 4;
+            rSum += data[idx];
+            gSum += data[idx + 1];
+            bSum += data[idx + 2];
+            count++;
+          }
+        }
+
+        cells[cy * GRID_SIZE + cx] = classifyColor(rSum/count, gSum/count, bSum/count);
+      }
+    }
+    return cells;
+  }
+
+  function loop() {
+    if (!running) return;
+    rafId = requestAnimationFrame(loop);
+
+    if (video.readyState < 2) return;
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return;
+
+    // Merkez bölgeyi al
+    const roiSize = Math.min(vw, vh) * ROI_RATIO;
+    const roiX = (vw - roiSize) / 2;
+    const roiY = (vh - roiSize) / 2;
+
+    sampleCanvas.width = SAMPLE_SIZE;
+    sampleCanvas.height = SAMPLE_SIZE;
+    sctx.drawImage(video, roiX, roiY, roiSize, roiSize, 0, 0, SAMPLE_SIZE, SAMPLE_SIZE);
+
+    const imgData = sctx.getImageData(0, 0, SAMPLE_SIZE, SAMPLE_SIZE);
+    const cells = readCellsFromImageData(imgData);
+    const frame = cellsToFrame(cells);
+
+    readCount++;
+    readInfo.textContent = readCount;
+
+    if (!validateFrame(frame)) return;
+
+    const info = parseFrameHeader(frame);
+    // Sanity: frame index < total, total makul, length makul
+    if (info.total === 0 || info.total > 2000) return;
+    // 2000 frame x 8 veri baytı = 16.000 bayt; vericiyle aynı sınır.
+    if (info.length === 0 || info.length > 16000) return;
+    if (info.total !== Math.max(1, Math.ceil(info.length / DATA_PER_FRAME))) return;
+    if (info.index >= info.total) return;
+
+    knownTotal = info.total;
+    knownLength = info.length;
+    totalInfo.textContent = knownTotal;
+
+    if (!receivedMap.has(info.index)) {
+      receivedMap.set(info.index, frame);
+      gotInfo.textContent = receivedMap.size;
+      updateProgress();
+      checkComplete();
+    }
+  }
+
+  function updateProgress() {
+    if (!knownTotal) return;
+    progressBar.style.width = ((receivedMap.size / knownTotal) * 100) + '%';
+  }
+
+  function checkComplete() {
+    if (!knownTotal || !knownLength) return;
+    if (receivedMap.size < knownTotal) return;
+
+    const assembled = assembleData(receivedMap, knownTotal, knownLength);
+    if (!assembled) return;
+
+    try {
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(assembled);
+      resultPre.textContent = text;
+      resultBox.classList.remove('hidden');
+      stopCamera();
+    } catch (err) {
+      resultPre.textContent = '(Çözümlenemedi: ' + err.message + ')';
+      resultBox.classList.remove('hidden');
+    }
+  }
+
+  function reset() {
+    receivedMap.clear();
+    knownTotal = null;
+    knownLength = null;
+    readCount = 0;
+    gotInfo.textContent = '0';
+    totalInfo.textContent = '?';
+    readInfo.textContent = '0';
+    progressBar.style.width = '0%';
+    resultBox.classList.add('hidden');
+    resultPre.textContent = '';
+  }
+
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+  resetBtn.addEventListener('click', reset);
+  window.addEventListener('resize', updateRoiOverlay);
+  window.addEventListener('orientationchange', updateRoiOverlay);
+  updateRoiOverlay();
+</script>
+</body>
+</html>

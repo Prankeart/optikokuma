@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Verici — Optik Transfer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+               background: #111; color: #eee; overflow: hidden; }
+  body { display: flex; flex-direction: column; }
+
+  header { padding: 8px 16px; background: #1a1a1a; display: flex; justify-content: space-between;
+           align-items: center; border-bottom: 1px solid #333; flex-shrink: 0; }
+  header h1 { font-size: 15px; font-weight: 600; }
+  header a { color: #6cf; text-decoration: none; font-size: 13px; }
+
+  .controls { padding: 10px 16px; background: #1a1a1a; display: flex; flex-direction: column;
+              gap: 8px; flex-shrink: 0; }
+  textarea { width: 100%; padding: 8px; background: #222; color: #eee; border: 1px solid #444;
+             border-radius: 6px; font-family: ui-monospace, monospace; font-size: 13px;
+             resize: vertical; }
+  .buttons { display: flex; gap: 8px; }
+  button { flex: 1; padding: 10px 12px; border: none; border-radius: 6px; background: #6cf;
+           color: #000; font-weight: 600; font-size: 13px; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.danger { background: #f66; }
+  button.secondary { background: #333; color: #eee; flex: 0 0 50px; }
+
+  .screen { flex: 1; display: flex; align-items: center; justify-content: center;
+            background: #000; padding: 8px; min-height: 0; }
+  canvas { max-width: 100%; max-height: 100%; image-rendering: pixelated; display: block; }
+
+  .status { padding: 6px 16px; background: #1a1a1a; font-size: 11px; color: #888;
+            font-family: ui-monospace, monospace; display: flex; gap: 16px;
+            flex-wrap: wrap; flex-shrink: 0; }
+  .status span { color: #eee; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📡 Verici</h1>
+  <a href="index.html">← Ana</a>
+</header>
+<div class="controls">
+  <textarea id="input" rows="2" placeholder="Gönderilecek metin...">Merhaba dünya! Bu bir test mesajıdır.</textarea>
+  <div class="buttons">
+    <button id="start">▶ Başlat</button>
+    <button id="stop" class="danger" disabled>■ Durdur</button>
+    <button id="fs" class="secondary">⛶</button>
+  </div>
+</div>
+<div class="screen">
+  <canvas id="canvas" width="512" height="512"></canvas>
+</div>
+<div class="status">
+  <div>Frame: <span id="frameInfo">—</span></div>
+  <div>FPS: <span id="fpsInfo">—</span></div>
+  <div>Veri: <span id="totalInfo">—</span></div>
+</div>
+
+<script src="shared.js"></script>
+<script>
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const input = document.getElementById('input');
+  const startBtn = document.getElementById('start');
+  const stopBtn = document.getElementById('stop');
+  const fsBtn = document.getElementById('fs');
+  const frameInfo = document.getElementById('frameInfo');
+  const fpsInfo = document.getElementById('fpsInfo');
+  const totalInfo = document.getElementById('totalInfo');
+
+  let frames = [];
+  let currentFrame = 0;
+  let timer = null;
+  let fpsCounter = 0;
+  let fpsLastTime = 0;
+  const targetFps = 3; // Kamera renkleri daha güvenilir okuyabilsin diye varsayılan hız düşürüldü.
+
+  function drawPlaceholder() {
+    const size = canvas.width;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#333';
+    ctx.font = '28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Hazır', size/2, size/2);
+  }
+
+  function drawFrame(idx) {
+    if (frames.length === 0) { drawPlaceholder(); return; }
+    const size = canvas.width;
+    const cellSize = size / GRID_SIZE;
+    const cells = frameToCells(frames[idx]);
+
+    for (let y = 0; y < GRID_SIZE; y++) {
+      for (let x = 0; x < GRID_SIZE; x++) {
+        const c = PALETTE[cells[y * GRID_SIZE + x]];
+        ctx.fillStyle = `rgb(${c.r},${c.g},${c.b})`;
+        ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+      }
+    }
+  }
+
+  function tick() {
+    if (frames.length === 0) return;
+    drawFrame(currentFrame);
+    frameInfo.textContent = `${currentFrame + 1} / ${frames.length}`;
+
+    fpsCounter++;
+    const now = performance.now();
+    if (now - fpsLastTime >= 1000) {
+      fpsInfo.textContent = fpsCounter;
+      fpsCounter = 0;
+      fpsLastTime = now;
+    }
+
+    currentFrame = (currentFrame + 1) % frames.length;
+  }
+
+  function start() {
+    const text = input.value;
+    if (text.length === 0) {
+      alert('Lütfen gönderilecek bir metin yazın.');
+      return;
+    }
+    const bytes = new TextEncoder().encode(text);
+    // Alıcı güvenlik sınırı: en fazla 2000 frame x 8 byte = 16.000 byte.
+    if (bytes.length > 16000) {
+      alert('Metin çok uzun. Bu sürüm en fazla 16.000 UTF-8 bayt (yaklaşık 16 KB) gönderebilir.');
+      return;
+    }
+    const result = encodeFrames(bytes);
+    frames = result.frames;
+    currentFrame = 0;
+    totalInfo.textContent = `${bytes.length} B / ${result.numFrames} frame`;
+    fpsLastTime = performance.now();
+    fpsCounter = 0;
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, 1000 / targetFps);
+    tick();
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+  }
+
+  function stop() {
+    if (timer) clearInterval(timer);
+    timer = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+  fsBtn.addEventListener('click', async () => {
+    try {
+      if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+      else await document.exitFullscreen();
+    } catch (err) {
+      alert('Tam ekran açılamadı. Tarayıcı izinlerini kontrol edin.');
+    }
+  });
+
+  drawPlaceholder();
+</script>
+</body>
+</html>
